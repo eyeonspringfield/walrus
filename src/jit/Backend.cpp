@@ -1681,10 +1681,13 @@ void JITCompiler::emitProlog()
     }
 
     ASSERT(m_lastBrTableLabels == nullptr);
+    sljit_emit_op0(m_compiler, SLJIT_PROLOG_MAGIC_MARKER);
 }
 
 void JITCompiler::emitEpilog()
 {
+    sljit_emit_op0(m_compiler, SLJIT_EPILOG_MAGIC_MARKER);
+
     FunctionList& func = m_functionList.back();
 
     ASSERT(m_context.branchTableOffset == reinterpret_cast<sljit_uw>(func.jitFunc->m_constData) + func.branchTableSize * sizeof(sljit_sw));

@@ -1,6 +1,6 @@
 [submodule "third_party/sljit"]
 	path = third_party/sljit
-	url = https://github.com/zherczeg/sljit
+	url = https://github.com/eyeonspringfield/sljit
 	ignore = untracked
 [submodule "third_party/GCutil"]
 	path = third_party/GCutil
