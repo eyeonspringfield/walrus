@@ -1,7 +1,7 @@
 [submodule "third_party/sljit"]
 	path = third_party/sljit
 	url = https://github.com/eyeonspringfield/sljit
-	ignore = untracked
+	branch = main
 [submodule "third_party/GCutil"]
 	path = third_party/GCutil
 	url = https://github.com/Samsung/gcutil.git
