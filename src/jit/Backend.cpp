@@ -1479,6 +1479,15 @@ void JITCompiler::generateCode()
 
     void* code = sljit_generate_code(m_compiler, 0, nullptr);
 
+    if (code != nullptr) {
+        size_t c = sljit_get_generated_code_size(m_compiler);
+        FILE* file = fopen("/tmp/jit_dump.bin", "wb");
+        if (file) {
+            fwrite(code, 1, c, file);
+            fclose(file);
+        }
+    }
+
 #ifdef WALRUS_JITPERF
     const bool perfEnabled = PerfDump::instance().perfEnabled();
     if (perfEnabled) {

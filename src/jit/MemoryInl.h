@@ -52,6 +52,34 @@ struct MemAddress {
     JITArg loadArg;
 };
 
+#if defined(WALRUS_CUSTOM_INSTRUCTIONS) && (defined(SLJIT_CONFIG_ARM_32) && SLJIT_CONFIG_ARM_32)
+static inline sljit_ins encodeWasmBchkInsn(sljit_s32 offsetReg, sljit_s32 limitReg, sljit_uw imm)
+{
+    sljit_s32 rd = sljit_get_register_index(SLJIT_GP_REGISTER, offsetReg);
+    sljit_s32 rlimit = sljit_get_register_index(SLJIT_GP_REGISTER, limitReg);
+
+    ASSERT(rd >= 0 && rd < 16);
+    ASSERT(rlimit >= 0 && rlimit < 16);
+    ASSERT(imm <= 0xff);
+
+    sljit_ins payload16 = (static_cast<sljit_ins>(rd) << 12) | (static_cast<sljit_ins>(rlimit) << 8) | imm;
+    return 0xE7F000F0u | ((payload16 & 0xFFF0u) << 4) | (payload16 & 0x000Fu);
+}
+
+static inline bool emitWasmBchk(sljit_compiler* compiler, sljit_s32 offsetReg, sljit_s32 limitReg, sljit_uw imm)
+{
+    if (imm > 0xff) {
+        return false;
+    }
+
+    sljit_ins instr = encodeWasmBchkInsn(offsetReg, limitReg, imm);
+    sljit_emit_op_custom(compiler, &instr, sizeof(instr));
+    // Tell SLJIT that carry is meaningful for the following conditional jump.
+    sljit_set_current_flags(compiler, SLJIT_SET_CARRY | SLJIT_CURRENT_FLAGS_ADD);
+    return true;
+}
+#endif
+
 void MemAddress::check(sljit_compiler* compiler, Operand* offsetOperand, sljit_uw offset, sljit_u32 size, sljit_u16 memIndex)
 {
     CompileContext* context = CompileContext::get(compiler);
@@ -169,18 +197,37 @@ void MemAddress::check(sljit_compiler* compiler, Operand* offsetOperand, sljit_u
 
     load(compiler);
 
+    bool emittedCustomBoundsCheck = false;
+
     if (offset > 0) {
 #if (defined SLJIT_64BIT_ARCHITECTURE && SLJIT_64BIT_ARCHITECTURE)
         sljit_emit_op2(compiler, SLJIT_ADD, offsetReg, 0, offsetReg, 0, SLJIT_IMM, static_cast<sljit_sw>(offset));
 #else /* !SLJIT_64BIT_ARCHITECTURE */
+#if defined(WALRUS_CUSTOM_INSTRUCTIONS) && (defined(SLJIT_CONFIG_ARM_32) && SLJIT_CONFIG_ARM_32)
+        if (initialMemorySize == maximumMemorySize) {
+            sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_TMP_DEST_REG, 0, SLJIT_IMM, static_cast<sljit_sw>(maximumMemorySize - size));
+        }
+
+        emittedCustomBoundsCheck = emitWasmBchk(compiler, offsetReg, SLJIT_TMP_DEST_REG, offset);
+
+        if (emittedCustomBoundsCheck) {
+            context->appendTrapJump(ExecutionContext::OutOfBoundsMemAccessError, sljit_emit_jump(compiler, SLJIT_CARRY));
+        } else {
+            sljit_emit_op2(compiler, SLJIT_ADD | SLJIT_SET_CARRY, offsetReg, 0, offsetReg, 0, SLJIT_IMM, static_cast<sljit_sw>(offset));
+            context->appendTrapJump(ExecutionContext::OutOfBoundsMemAccessError, sljit_emit_jump(compiler, SLJIT_CARRY));
+        }
+#else
         sljit_emit_op2(compiler, SLJIT_ADD | SLJIT_SET_CARRY, offsetReg, 0, offsetReg, 0, SLJIT_IMM, static_cast<sljit_sw>(offset));
         context->appendTrapJump(ExecutionContext::OutOfBoundsMemAccessError, sljit_emit_jump(compiler, SLJIT_CARRY));
+#endif
 #endif /* SLJIT_64BIT_ARCHITECTURE */
     }
 
     if (initialMemorySize == maximumMemorySize) {
-        sljit_jump* cmp = sljit_emit_cmp(compiler, SLJIT_GREATER, offsetReg, 0, SLJIT_IMM, static_cast<sljit_sw>(maximumMemorySize - size));
-        context->appendTrapJump(ExecutionContext::OutOfBoundsMemAccessError, cmp);
+        if (!emittedCustomBoundsCheck) {
+            sljit_jump* cmp = sljit_emit_cmp(compiler, SLJIT_GREATER, offsetReg, 0, SLJIT_IMM, static_cast<sljit_sw>(maximumMemorySize - size));
+            context->appendTrapJump(ExecutionContext::OutOfBoundsMemAccessError, cmp);
+        }
 
         memArg.arg = SLJIT_MEM2(baseReg, offsetReg);
         memArg.argw = 0;
@@ -204,8 +251,10 @@ void MemAddress::check(sljit_compiler* compiler, Operand* offsetOperand, sljit_u
         return;
     }
 
-    sljit_jump* cmp = sljit_emit_cmp(compiler, SLJIT_GREATER, offsetReg, 0, SLJIT_TMP_DEST_REG, 0);
-    context->appendTrapJump(ExecutionContext::OutOfBoundsMemAccessError, cmp);
+    if (!emittedCustomBoundsCheck) {
+        sljit_jump* cmp = sljit_emit_cmp(compiler, SLJIT_GREATER, offsetReg, 0, SLJIT_TMP_DEST_REG, 0);
+        context->appendTrapJump(ExecutionContext::OutOfBoundsMemAccessError, cmp);
+    }
 
     sljit_emit_op2(compiler, SLJIT_ADD, baseReg, 0, baseReg, 0, offsetReg, 0);
 
