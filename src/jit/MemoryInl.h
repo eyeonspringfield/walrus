@@ -78,6 +78,89 @@ static inline bool emitWasmBchk(sljit_compiler* compiler, sljit_s32 offsetReg, s
     sljit_set_current_flags(compiler, SLJIT_SET_CARRY | SLJIT_CURRENT_FLAGS_ADD);
     return true;
 }
+
+enum WasmMemMode : sljit_s32 {
+    WasmMemModeU8 = 0,
+    WasmMemModeS8 = 1,
+    WasmMemModeU16 = 2,
+    WasmMemModeS16 = 3,
+    WasmMemModeU32 = 4,
+};
+
+static inline sljit_s32 getWasmLoadMode(sljit_s32 opcode)
+{
+    switch (opcode) {
+    case SLJIT_MOV32_U8:
+        return WasmMemModeU8;
+    case SLJIT_MOV32_S8:
+        return WasmMemModeS8;
+    case SLJIT_MOV32_U16:
+        return WasmMemModeU16;
+    case SLJIT_MOV32_S16:
+        return WasmMemModeS16;
+    case SLJIT_MOV32:
+    case SLJIT_MOV:
+        return WasmMemModeU32;
+    default:
+        return -1;
+    }
+}
+
+static inline sljit_s32 getWasmStoreMode(sljit_s32 opcode)
+{
+    switch (opcode) {
+    case SLJIT_MOV32_U8:
+        return WasmMemModeU8;
+    case SLJIT_MOV32_U16:
+        return WasmMemModeU16;
+    case SLJIT_MOV32:
+    case SLJIT_MOV:
+        return WasmMemModeU32;
+    default:
+        return -1;
+    }
+}
+
+static inline sljit_ins encodeWasmMemInsn(sljit_ins tag, sljit_s32 dataReg, sljit_s32 baseReg, sljit_s32 offsetReg, sljit_s32 mode)
+{
+    sljit_s32 data = sljit_get_register_index(SLJIT_GP_REGISTER, dataReg);
+    sljit_s32 base = sljit_get_register_index(SLJIT_GP_REGISTER, baseReg);
+    sljit_s32 offset = sljit_get_register_index(SLJIT_GP_REGISTER, offsetReg);
+
+    ASSERT(data >= 0 && data < 16);
+    ASSERT(base >= 0 && base < 16);
+    ASSERT(offset >= 0 && offset < 16);
+    ASSERT(mode >= 0 && mode < 16);
+
+    sljit_ins payload16 = (static_cast<sljit_ins>(data) << 12) | (static_cast<sljit_ins>(base) << 8) | (static_cast<sljit_ins>(offset) << 4) | static_cast<sljit_ins>(mode);
+    return tag | ((payload16 & 0xFFF0u) << 4) | (payload16 & 0x000Fu);
+}
+
+static inline bool emitWasmLd(sljit_compiler* compiler, sljit_s32 dstReg, sljit_s32 baseReg, sljit_s32 offsetReg, sljit_s32 opcode)
+{
+    sljit_s32 mode = getWasmLoadMode(opcode);
+
+    if (mode < 0) {
+        return false;
+    }
+
+    sljit_ins instr = encodeWasmMemInsn(0xE7E000F0u, dstReg, baseReg, offsetReg, mode);
+    sljit_emit_op_custom(compiler, &instr, sizeof(instr));
+    return true;
+}
+
+static inline bool emitWasmStr(sljit_compiler* compiler, sljit_s32 srcReg, sljit_s32 baseReg, sljit_s32 offsetReg, sljit_s32 opcode)
+{
+    sljit_s32 mode = getWasmStoreMode(opcode);
+
+    if (mode < 0) {
+        return false;
+    }
+
+    sljit_ins instr = encodeWasmMemInsn(0xE7D000F0u, srcReg, baseReg, offsetReg, mode);
+    sljit_emit_op_custom(compiler, &instr, sizeof(instr));
+    return true;
+}
 #endif
 
 void MemAddress::check(sljit_compiler* compiler, Operand* offsetOperand, sljit_uw offset, sljit_u32 size, sljit_u16 memIndex)
@@ -711,8 +794,18 @@ static void emitLoad(sljit_compiler* compiler, Instruction* instr)
     JITArg valueArg(operands + 1);
     sljit_s32 dstReg = GET_TARGET_REG(valueArg.arg, SLJIT_TMP_DEST_REG);
 
+    bool emittedCustomLoad = false;
+
+#if defined(WALRUS_CUSTOM_INSTRUCTIONS) && (defined(SLJIT_CONFIG_ARM_32) && SLJIT_CONFIG_ARM_32)
+    if (SLJIT_IS_MEM2(addr.memArg.arg) && addr.memArg.argw == 0) {
+        emittedCustomLoad = emitWasmLd(compiler, dstReg, SLJIT_EXTRACT_REG(addr.memArg.arg), SLJIT_EXTRACT_SECOND_REG(addr.memArg.arg), opcode);
+    }
+#endif
+
     // TODO: sljit_emit_mem for unaligned access
-    sljit_emit_op1(compiler, opcode, dstReg, 0, addr.memArg.arg, addr.memArg.argw);
+    if (!emittedCustomLoad) {
+        sljit_emit_op1(compiler, opcode, dstReg, 0, addr.memArg.arg, addr.memArg.argw);
+    }
 
     if (!SLJIT_IS_MEM(valueArg.arg)) {
         return;
@@ -1114,6 +1207,20 @@ static void emitStore(sljit_compiler* compiler, Instruction* instr)
         addr.loadArg.arg = instr->requiredReg(2);
         addr.loadArg.argw = 0;
     }
+
+#if defined(WALRUS_CUSTOM_INSTRUCTIONS) && (defined(SLJIT_CONFIG_ARM_32) && SLJIT_CONFIG_ARM_32)
+    if (SLJIT_IS_MEM2(addr.memArg.arg) && addr.memArg.argw == 0) {
+        sljit_s32 srcReg = GET_SOURCE_REG(addr.loadArg.arg, instr->requiredReg(2));
+
+        if (SLJIT_IS_IMM(addr.loadArg.arg)) {
+            sljit_emit_op1(compiler, SLJIT_MOV, srcReg, 0, SLJIT_IMM, addr.loadArg.argw);
+        }
+
+        if (emitWasmStr(compiler, srcReg, SLJIT_EXTRACT_REG(addr.memArg.arg), SLJIT_EXTRACT_SECOND_REG(addr.memArg.arg), opcode)) {
+            return;
+        }
+    }
+#endif
 
     // TODO: sljit_emit_mem for unaligned access
     sljit_emit_op1(compiler, opcode, addr.memArg.arg, addr.memArg.argw, addr.loadArg.arg, addr.loadArg.argw);
